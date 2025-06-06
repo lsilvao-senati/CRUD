@@ -51,33 +51,80 @@ class CRUDGenerator:
 
     def parse_columns(self, columns_def: str) -> List[Dict]:
         """Extrae información de las columnas de una tabla"""
-        columns = []
+        parsed_columns = []
         lines = [line.strip().rstrip(',') for line in columns_def.split('\n') if line.strip()]
+
+        foreign_keys_info = {} # Stores FK constraints: fk_col_name -> {table: ref_table, column: ref_col}
+        raw_column_definitions = [] # Stores basic column data before FK enrichment
+
+        # First pass: identify FK constraints and basic column definitions
         for line in lines:
             line = line.strip().rstrip(',')
             if not line:
                 continue
-            # Ignorar constraints y keys
-            if re.match(r'^\s*(?:PRIMARY\s+KEY|KEY|INDEX|CONSTRAINT|FOREIGN\s+KEY|UNIQUE)', line, re.IGNORECASE):
+
+            # Regex for FOREIGN KEY constraints (updated for schema.table)
+            fk_match = re.match(r'^\s*(?:CONSTRAINT\s+[`"]?\w+[`"]?\s+)?FOREIGN\s+KEY\s+\([`"]?(\w+)[`"]?\)\s+REFERENCES\s+((?:[`"]?\w+[`"]?\s*\.\s*)?[`"]?\w+[`"]?)\s*\([`"]?(\w+)[`"]?\)', line, re.IGNORECASE)
+            if fk_match:
+                fk_col_name = fk_match.group(1)
+                raw_ref_table = fk_match.group(2)
+                ref_col_name = fk_match.group(3)
+                cleaned_ref_table = raw_ref_table.split('.')[-1].replace('`', '').replace('"', '')
+                foreign_keys_info[fk_col_name] = {'table': cleaned_ref_table, 'column': ref_col_name}
                 continue
-            # Extraer nombre y tipo de columna (más robusto)
+
+            # Regex for column definitions (robust)
             col_match = re.match(r'[`"]?(\w+)[`"]?\s+(\w+)(?:\((\d+)(?:,\d+)?\))?\s*(.*?)$', line, re.IGNORECASE)
             if col_match:
+                # Skip lines that are actually other types of constraints but might loosely match col_match
+                if re.match(r'^\s*(?:PRIMARY\s+KEY|KEY|INDEX|UNIQUE|CONSTRAINT)', line, re.IGNORECASE):
+                    # This check is refined: only skip if it's NOT also a column definition (rare)
+                    # but primarily to ensure constraint-only lines are not mistaken for columns.
+                    # A more precise way would be to ensure line doesn't start with these keywords,
+                    # unless it's part of an inline definition which col_match handles.
+                    # For now, if it starts like a constraint and IS NOT a FK line (already continued), skip.
+                     if not fk_match: # fk_match would have already caused a continue
+                        is_just_constraint = True
+                        # Further check: does it look like a column name followed by a type?
+                        # If not, it's likely just a constraint definition.
+                        # This is a heuristic; SQL grammar is complex.
+                        if re.match(r'[`"]?(\w+)[`"]?\s+\w+', line): # Looks like col + type
+                             is_just_constraint = False
+
+                        if is_just_constraint:
+                            continue
+
                 col_name = col_match.group(1)
                 sql_type = col_match.group(2)
                 details = col_match.group(4)
-                nullable = 'NOT NULL' not in details.upper()
-                primary_key = 'PRIMARY KEY' in details.upper()
-                auto_increment = 'AUTO_INCREMENT' in details.upper()
                 
-                columns.append({
+                raw_column_definitions.append({
                     'name': col_name,
-                    'type': sql_type.lower(),
-                    'nullable': nullable,
-                    'primary_key': primary_key,
-                    'auto_increment': auto_increment
+                    'sql_type': sql_type.lower(), # Store original SQL type for now
+                    'details_str': details # Store details string for PK/AI/NOT NULL checks
                 })
-        return columns
+                continue # Move to next line once column definition is found
+
+        # Second pass: enrich column definitions with FK info and other details
+        for raw_col_def in raw_column_definitions:
+            col_name = raw_col_def['name']
+            details = raw_col_def['details_str']
+
+            column_data = {
+                'name': col_name,
+                'type': raw_col_def['sql_type'],
+                'nullable': 'NOT NULL' not in details.upper(),
+                'primary_key': 'PRIMARY KEY' in details.upper(),
+                'auto_increment': 'AUTO_INCREMENT' in details.upper()
+            }
+
+            if col_name in foreign_keys_info:
+                column_data['foreign_key_to_table'] = foreign_keys_info[col_name]['table']
+                column_data['foreign_key_to_column'] = foreign_keys_info[col_name]['column']
+
+            parsed_columns.append(column_data)
+
+        return parsed_columns
     
     def get_php_type(self, sql_type: str) -> str:
         """Convierte tipos SQL a tipos PHP para validación"""
@@ -102,8 +149,12 @@ class CRUDGenerator:
         }
         return type_mapping.get(sql_type, 'string')
     
-    def get_input_type(self, sql_type: str) -> str:
-        """Determina el tipo de input HTML basado en el tipo SQL"""
+    def get_input_type(self, column: Dict) -> str:
+        """Determina el tipo de input HTML basado en el tipo SQL y si es foreign key"""
+        if 'foreign_key_to_table' in column:
+            return 'select'
+
+        sql_type = column['type']
         if sql_type in ['int', 'integer', 'bigint', 'smallint', 'tinyint']:
             return 'number'
         elif sql_type in ['date']:
@@ -230,10 +281,41 @@ class {class_name} {{
         }}
         return false;
     }}
+
+    // --- Métodos para Foreign Keys ---
+{self.generate_foreign_key_methods(columns)}
+
 }}
 ?>"""
         return model_content
     
+    def generate_foreign_key_methods(self, columns: List[Dict]) -> str:
+        """Genera métodos para obtener datos de tablas referenciadas por foreign keys"""
+        fk_methods_content = []
+        processed_fk_tables = set() # Para evitar métodos duplicados si múltiples FKs apuntan a la misma tabla
+
+        for col in columns:
+            if 'foreign_key_to_table' in col:
+                ref_table = col['foreign_key_to_table']
+                if ref_table not in processed_fk_tables:
+                    method_name = f"get_all_{ref_table}"
+                    # Asumimos que la tabla referenciada tiene 'id' como PK y 'nombre' (o 'name') como columna descriptiva
+                    # Esto podría necesitar ser más configurable en el futuro.
+                    fk_methods_content.append(f"""
+    // Obtener todos los registros de {ref_table} para dropdowns/selects
+    public function {method_name}() {{
+        $query = "SELECT id, nombre FROM {ref_table} ORDER BY nombre ASC"; // Asume 'nombre' para ordenamiento
+        // Intenta con 'name' si 'nombre' no es común, o hacerlo configurable
+        // $query = "SELECT id, name FROM {ref_table} ORDER BY name ASC";
+        $stmt = $this->conn->prepare($query);
+        $stmt->execute();
+        return $stmt;
+    }}
+""")
+                    processed_fk_tables.add(ref_table)
+
+        return chr(10).join(fk_methods_content)
+
     def generate_controller(self, table_name: str, columns: List[Dict]) -> str:
         """Genera el controlador para una tabla"""
         class_name = self.to_class_name(table_name)
@@ -255,6 +337,20 @@ class {class_name}Controller {{
     
     // Mostrar formulario de creación
     public function create() {{
+        ${table_name}_model = new {class_name}();
+        $view_data = [];
+        $processed_fk_tables_for_view_data = []; // Helper to avoid redundant fetches if multiple FKs to same table
+
+        // Cargar datos para selectores de claves foráneas
+        // Iteramos sobre las columnas (definidas en Python al generar este controlador)
+        {self.generate_fk_data_loading_php(columns, f'${{{table_name}_model}}', '$view_data', '$processed_fk_tables_for_view_data')}
+
+        // Hacer $view_data disponible para la vista (ya está en el scope)
+        // y también extraer sus claves a variables individuales para conveniencia
+        foreach ($view_data as $key => $value) {{
+            $$key = $value;
+        }}
+
         include 'views/{table_name}/create.php';
     }}
     
@@ -275,10 +371,28 @@ class {class_name}Controller {{
     
     // Mostrar formulario de edición
     public function edit() {{
-        ${table_name} = new {class_name}();
+        ${table_name} = new {class_name}(); // Model instance for the main table
         ${table_name}->{primary_key} = $_GET['id'] ?? 0;
         ${table_name}->readOne();
         
+        $view_data = [];
+        $processed_fk_tables_for_view_data = []; // Helper to avoid redundant fetches
+
+        // Cargar datos para selectores de claves foráneas
+        // Iteramos sobre las columnas (definidas en Python al generar este controlador)
+        {self.generate_fk_data_loading_php(columns, f'${{{table_name}}}', '$view_data', '$processed_fk_tables_for_view_data')}
+
+        // Hacer $view_data disponible para la vista
+        foreach ($view_data as $key => $value) {{
+            $$key = $value;
+                }}
+            }}
+        }}
+        // Hacer $view_data disponible para la vista
+        foreach ($view_data as $key => $value) {{
+            $$key = $value;
+        }}
+
         include 'views/{table_name}/edit.php';
     }}
     
@@ -310,6 +424,32 @@ class {class_name}Controller {{
 }}
 ?>"""
         return controller_content
+
+    def generate_fk_data_loading_php(self, columns: List[Dict], model_var_name: str, view_data_var_name: str, processed_var_name: str) -> str:
+        """Generates PHP code snippet for loading foreign key data for views."""
+        php_code_lines = []
+        # Track processed tables within this specific call to avoid duplicate data loading logic
+        # if multiple FK columns point to the same referenced table.
+        # Note: $processed_fk_tables_for_view_data is the PHP variable name passed in for this purpose.
+
+        for col in columns:
+            if 'foreign_key_to_table' in col:
+                ref_table = col['foreign_key_to_table']
+
+                # PHP code to check if already processed
+                php_code_lines.append(f"""
+        if (!isset({processed_var_name}['{ref_table}'])) {{""")
+
+                fk_method_name = f"get_all_{ref_table}"
+                php_code_lines.append(f"""
+            if (method_exists({model_var_name}, '{fk_method_name}')) {{
+                $stmt = {model_var_name}->{fk_method_name}();
+                {view_data_var_name}['{ref_table}_options'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                {processed_var_name}['{ref_table}'] = true; // Mark as processed
+            }}""")
+                php_code_lines.append(f"""
+        }}""")
+        return "".join(php_code_lines)
     
     def generate_layout_file(self) -> str:
         """Genera el archivo de layout común con barra de navegación"""
@@ -439,7 +579,7 @@ include(__DIR__ . '/../layout.php');
             if col.get('auto_increment'):
                 continue
             
-            input_type = self.get_input_type(col['type'])
+            input_type = self.get_input_type(col)
             required = '' if col['nullable'] else 'required'
             
             if input_type == 'textarea':
@@ -453,6 +593,21 @@ include(__DIR__ . '/../layout.php');
                 <div class="mb-3 form-check">
                     <input type="checkbox" class="form-check-input" id="{col['name']}" name="{col['name']}" value="1">
                     <label class="form-check-label" for="{col['name']}">{col['name'].replace('_', ' ').title()}</label>
+                </div>""")
+            elif input_type == 'select':
+                form_fields.append(f"""
+                <div class="mb-3">
+                    <label for="{col['name']}" class="form-label">{col['name'].replace('_', ' ').title()}</label>
+                    <select class="form-select" id="{col['name']}" name="{col['name']}" {required}>
+                        <option value="" selected disabled>-- Seleccione {col['name'].replace('_', ' ').title()} --</option>
+                        <?php if (!empty(${col['foreign_key_to_table']}_options)): ?>
+                            <?php foreach (${col['foreign_key_to_table']}_options as $option): ?>
+                                <option value="<?= htmlspecialchars($option['id']) ?>">
+                                    <?= htmlspecialchars($option['nombre']) ?> <?php // Assume 'nombre' or 'name' for display ?>
+                                </option>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </select>
                 </div>""")
             else:
                 form_fields.append(f"""
@@ -509,7 +664,7 @@ include(__DIR__ . '/../layout.php');
         
         form_fields = []
         for col in columns:
-            input_type = self.get_input_type(col['type'])
+            input_type = self.get_input_type(col)
             required = '' if col['nullable'] else 'required'
             
             if col.get('auto_increment'):
@@ -529,6 +684,21 @@ include(__DIR__ . '/../layout.php');
                     <input type="checkbox" class="form-check-input" id="{col['name']}" name="{col['name']}" value="1" 
                            <?= ${table_name}->{col['name']} ? 'checked' : '' ?>>
                     <label class="form-check-label" for="{col['name']}">{col['name'].replace('_', ' ').title()}</label>
+                </div>""")
+            elif input_type == 'select':
+                form_fields.append(f"""
+                <div class="mb-3">
+                    <label for="{col['name']}" class="form-label">{col['name'].replace('_', ' ').title()}</label>
+                    <select class="form-select" id="{col['name']}" name="{col['name']}" {required}>
+                        <option value="">-- Seleccione {col['name'].replace('_', ' ').title()} --</option>
+                        <?php if (!empty(${col['foreign_key_to_table']}_options)): ?>
+                            <?php foreach (${col['foreign_key_to_table']}_options as $option): ?>
+                                <option value="<?= htmlspecialchars($option['id']) ?>" <?= (isset(${table_name}->{col['name']}) && $option['id'] == ${table_name}->{col['name']}) ? 'selected' : '' ?>>
+                                    <?= htmlspecialchars($option['nombre']) ?> <?php // Assume 'nombre' or 'name' for display ?>
+                                </option>
+                            <?php endforeach; ?>
+                        <?php endif; ?>
+                    </select>
                 </div>""")
             else:
                 form_fields.append(f"""
